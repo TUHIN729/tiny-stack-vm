@@ -1,135 +1,119 @@
-// Tiny stack VM: runs every instance in MAKEFUN_INPUT_DIR on the ISA in
-// program/generator/subject/ISA.md, writing each program's stdout and exit
-// code under MAKEFUN_OUTPUT_DIR. Node 22, no dependencies, deterministic.
-import { mkdirSync, readFileSync, readdirSync, writeFileSync } from 'node:fs';
+// Tiny Stack VM — make.fun tiny-stack-vm-01-run-20261122.
+// Runs each /input/<id>/program.bin on its input.bin, writing
+// /output/<id>/stdout.bin + exit.txt per the published ISA.
+import { mkdirSync, readdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 
-const INPUT = process.env.MAKEFUN_INPUT_DIR ?? '/input';
-const OUTPUT = process.env.MAKEFUN_OUTPUT_DIR ?? '/output';
+const IN = process.env.MAKEFUN_INPUT_DIR ?? '/input';
+const OUT = process.env.MAKEFUN_OUTPUT_DIR ?? '/output';
 
-// Opcode tables, indexed by opcode byte (0x00-0x53): immediate bytes, values
-// popped, values pushed, and whether the byte is a real opcode at all.
-const IMM = '014000000000000000000000000000000000000000000000222200000000000000000000000000000000';
-const POP = '000112230000000022222221222122202220000000000000011000000000000012000000000000001101';
-const PSH = '011022330000000011111111111111101110000000000000000000000000000010000000000000000010';
-const VAL = '111111110000000011111111111111111110000000000000111110000000000011000000000000001111';
+// Opcode table, one char per opcode byte (0x00-0x53): the char is
+// 48 + immCode*16 + pops*4 + pushes (immCode 0/1/2/3 = imm 0/1/4/2);
+// '!' marks no opcode. 'A' is PUSH8, '9' a binary op, '`' JMP/CALL.
+const T = '0AQ46:;?!!!!!!!!999999959995999!999!!!!!!!!!!!!!`dd`0!!!!!!!!!!!58!!!!!!!!!!!!!!4414';
+const IMM = [0, 1, 4, 2];
 
-function run(prog: Buffer, input: Buffer): { out: Buffer; code: number } {
-  const n = prog.length;
-  const st = new Int32Array(256);
-  const cs = new Int32Array(64);
-  const mem = new Int32Array(256);
-  const out: number[] = [];
-  let sp = 0, cp = 0, pc = 0, steps = 0, ip = 0;
-  const end = (code: number) => ({ out: Buffer.from(out), code });
-
-  for (;;) {
-    if (steps >= 1e6) return end(10);
-    if (pc < 0 || pc >= n) return end(9);
-    const op = prog[pc];
-    if (VAL[op] !== '1') return end(5);
-    const imm = IMM.charCodeAt(op) - 48;
-    const pops = POP.charCodeAt(op) - 48;
-    const pushes = PSH.charCodeAt(op) - 48;
-    if (pc + imm >= n) return end(9);
-    steps++;
-    if (sp < pops) return end(2);
-    if (sp - pops + pushes > 256) return end(3);
-    const next = pc + 1 + imm;
-    pc = next;
-
+for (const id of readdirSync(IN).sort()) {
+  const di = join(IN, id), od = join(OUT, id);
+  const p = readFileSync(join(di, 'program.bin'));
+  const q = readFileSync(join(di, 'input.bin'));
+  const n = p.length;
+  const D = new Int32Array(256), C = new Int32Array(64), M = new Int32Array(256);
+  const O = new Uint8Array(65536);
+  let sp = 0, cp = 0, ol = 0, ip = 0, pc = 0, st = 0, ex = 0;
+  run: for (;;) {
+    if (st === 1e6) { ex = 10; break; }
+    if (pc < 0 || pc >= n) { ex = 9; break; }
+    const op = p[pc];
+    const t = T.charCodeAt(op) - 48;
+    if (!(t >= 0 && t <= 63)) { ex = 5; break; }
+    const imm = IMM[t >> 4], po = (t >> 2) & 3, pu = t & 3;
+    if (pc + imm >= n) { ex = 9; break; }
+    st++;
+    const nx = pc + 1 + imm;
+    if (sp < po) { ex = 2; break; }
+    if (sp - po + pu > 256) { ex = 3; break; }
+    pc = nx;
+    if (op === 0x17 || op === 0x1b) { D[sp - 1] = op === 0x17 ? -D[sp - 1] | 0 : ~D[sp - 1]; continue; }
+    if (op >= 0x10 && op < 0x23) {
+      const b = D[sp - 1], a = D[sp - 2];
+      if (op >= 0x13 && op <= 0x16 && b === 0) { ex = 4; break; }
+      let r = 0;
+      switch (op) {
+        case 0x10: r = a + b | 0; break;
+        case 0x11: r = a - b | 0; break;
+        case 0x12: r = Math.imul(a, b); break;
+        case 0x13: r = a / b | 0; break;
+        case 0x14: r = a % b | 0; break;
+        case 0x15: r = (a >>> 0) / (b >>> 0) | 0; break;
+        case 0x16: r = (a >>> 0) % (b >>> 0) | 0; break;
+        case 0x18: r = a & b; break;
+        case 0x19: r = a | b; break;
+        case 0x1a: r = a ^ b; break;
+        case 0x1c: r = a << (b & 31); break;
+        case 0x1d: r = a >> (b & 31); break;
+        case 0x1e: r = a >>> (b & 31) | 0; break;
+        case 0x20: r = a === b ? 1 : 0; break;
+        case 0x21: r = a < b ? 1 : 0; break;
+        case 0x22: r = (a >>> 0) < (b >>> 0) ? 1 : 0; break;
+      }
+      D[sp - 2] = r;
+      sp--;
+      continue;
+    }
+    if (op >= 0x30 && op < 0x33) {
+      const rel = p.readInt16LE(nx - 2);
+      if (op === 0x30 || (op === 0x31 && D[--sp] === 0) || (op === 0x32 && D[--sp] !== 0)) pc += rel;
+      continue;
+    }
     switch (op) {
-      case 0x00: return end(0); // HALT
-      case 0x01: st[sp++] = (prog[pc - 1] << 24) >> 24; break; // PUSH8
-      case 0x02: // PUSH32, little-endian signed
-        st[sp++] = prog[pc - 4] | (prog[pc - 3] << 8) | (prog[pc - 2] << 16) | (prog[pc - 1] << 24);
+      case 0: ex = 0; break run;
+      case 1: D[sp++] = p.readInt8(pc - 1); break;
+      case 2: D[sp++] = p.readInt32LE(pc - 4); break;
+      case 3: sp--; break;
+      case 4: D[sp] = D[sp - 1]; sp++; break;
+      case 5: { const t = D[sp - 1]; D[sp - 1] = D[sp - 2]; D[sp - 2] = t; break; }
+      case 6: D[sp] = D[sp - 2]; sp++; break;
+      case 7: { const a = D[sp - 3]; D[sp - 3] = D[sp - 2]; D[sp - 2] = D[sp - 1]; D[sp - 1] = a; break; }
+      case 0x33:
+        if (cp === 64) { ex = 7; break run; }
+        C[cp++] = pc;
+        pc = p.readUInt16LE(pc - 2);
         break;
-      case 0x03: sp--; break; // POP
-      case 0x04: st[sp] = st[sp - 1]; sp++; break; // DUP
-      case 0x05: { const t = st[sp - 1]; st[sp - 1] = st[sp - 2]; st[sp - 2] = t; break; } // SWAP
-      case 0x06: st[sp] = st[sp - 2]; sp++; break; // OVER
-      case 0x07: { const a = st[sp - 3]; st[sp - 3] = st[sp - 2]; st[sp - 2] = st[sp - 1]; st[sp - 1] = a; break; } // ROT
-      case 0x17: st[sp - 1] = -st[sp - 1] | 0; break; // NEG
-      case 0x1b: st[sp - 1] = ~st[sp - 1]; break; // NOT
-      case 0x30: case 0x31: case 0x32: { // JMP / JZ / JNZ
-        let rel = prog[pc - 2] | (prog[pc - 1] << 8);
-        if (rel & 0x8000) rel -= 0x10000;
-        let take = true;
-        if (op !== 0x30) { const v = st[--sp]; take = op === 0x31 ? v === 0 : v !== 0; }
-        if (take) pc = next + rel;
+      case 0x34:
+        if (cp === 0) { ex = 8; break run; }
+        pc = C[--cp];
         break;
-      }
-      case 0x33: // CALL: push next address, jump to unsigned target
-        if (cp === 64) return end(7);
-        cs[cp++] = next;
-        pc = prog[pc - 2] | (prog[pc - 1] << 8);
-        break;
-      case 0x34: if (cp === 0) return end(8); pc = cs[--cp]; break; // RET
-      case 0x40: { // LOAD
-        const a = st[sp - 1];
-        if (a < 0 || a >= 256) return end(6);
-        st[sp - 1] = mem[a];
+      case 0x40: {
+        const a = D[sp - 1];
+        if (a < 0 || a >= 256) { ex = 6; break run; }
+        D[sp - 1] = M[a];
         break;
       }
-      case 0x41: { // STORE: ( v addr -- )
-        const a = st[sp - 1], v = st[sp - 2];
-        if (a < 0 || a >= 256) return end(6);
+      case 0x41: {
+        const a = D[sp - 1];
+        if (a < 0 || a >= 256) { ex = 6; break run; }
+        M[a] = D[sp - 2];
         sp -= 2;
-        mem[a] = v;
         break;
       }
-      case 0x50: { // PRINT: decimal ASCII, no newline
-        const t = String(st[sp - 1]);
-        if (out.length + t.length > 65536) return end(11);
+      case 0x50: {
+        const b = Buffer.from(String(D[sp - 1]));
+        if (ol + b.length > 65536) { ex = 11; break run; }
         sp--;
-        for (let i = 0; i < t.length; i++) out.push(t.charCodeAt(i));
+        O.set(b, ol);
+        ol += b.length;
         break;
       }
-      case 0x51: // PUTC: low byte
-        if (out.length + 1 > 65536) return end(11);
-        out.push(st[--sp] & 255);
+      case 0x51:
+        if (ol + 1 > 65536) { ex = 11; break run; }
+        O[ol++] = D[--sp] & 255;
         break;
-      case 0x52: st[sp++] = ip < input.length ? input[ip++] : -1; break; // IN
-      case 0x53: return end(st[--sp] & 255); // EXIT
-      default: { // two-operand arithmetic, logic and comparison
-        const b = st[sp - 1], a = st[sp - 2];
-        let r: number;
-        switch (op) {
-          case 0x10: r = (a + b) | 0; break;
-          case 0x11: r = (a - b) | 0; break;
-          case 0x12: r = Math.imul(a, b); break;
-          case 0x13: // DIV, signed truncating; INT_MIN / -1 stays INT_MIN
-            if (b === 0) return end(4);
-            r = a === -2147483648 && b === -1 ? a : (a / b) | 0;
-            break;
-          case 0x14: // MOD, sign of a; x % -1 is 0
-            if (b === 0) return end(4);
-            r = b === -1 ? 0 : (a % b) | 0;
-            break;
-          case 0x15: if (b === 0) return end(4); r = Math.floor((a >>> 0) / (b >>> 0)) | 0; break; // DIVU
-          case 0x16: if (b === 0) return end(4); r = ((a >>> 0) % (b >>> 0)) | 0; break; // MODU
-          case 0x18: r = a & b; break;
-          case 0x19: r = a | b; break;
-          case 0x1a: r = a ^ b; break;
-          case 0x1c: r = a << (b & 31); break;
-          case 0x1d: r = a >> (b & 31); break;
-          case 0x1e: r = (a >>> (b & 31)) | 0; break;
-          case 0x20: r = a === b ? 1 : 0; break;
-          case 0x21: r = a < b ? 1 : 0; break;
-          default: r = (a >>> 0) < (b >>> 0) ? 1 : 0; // LTU
-        }
-        sp -= 2;
-        st[sp++] = r;
-      }
+      case 0x52: D[sp++] = ip < q.length ? q[ip++] : -1; break;
+      case 0x53: ex = D[--sp] & 255; break run;
     }
   }
-}
-
-for (const id of readdirSync(INPUT).sort()) {
-  const prog = readFileSync(join(INPUT, id, 'program.bin'));
-  const input = readFileSync(join(INPUT, id, 'input.bin'));
-  const { out, code } = run(prog, input);
-  mkdirSync(join(OUTPUT, id), { recursive: true });
-  writeFileSync(join(OUTPUT, id, 'stdout.bin'), out);
-  writeFileSync(join(OUTPUT, id, 'exit.txt'), `${code}\n`);
+  mkdirSync(od, { recursive: true });
+  writeFileSync(join(od, 'stdout.bin'), O.subarray(0, ol));
+  writeFileSync(join(od, 'exit.txt'), ex + '\n');
 }
